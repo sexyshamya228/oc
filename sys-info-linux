@@ -1,0 +1,203 @@
+import os
+import ctypes
+import ctypes.util
+import pwd
+import platform
+
+
+libc_path = ctypes.util.find_library("c")
+if not libc_path:
+    raise RuntimeError("Не удалось найти libc в системе")
+libc = ctypes.CDLL(libc_path, use_last_error=True)
+
+
+# Структура для вызова uname().
+# uname() возвращает основную информацию об ОС:
+# - sysname: имя ядра (например, "Linux")
+# - nodename: имя хоста (hostname)
+# - release: версия ядра
+# - version: внутренняя строка версии
+# - machine: архитектура (x86_64, arm64 и т.д.)
+class Utsname(ctypes.Structure):
+    _fields_ = [
+        ("sysname", ctypes.c_char * 65),
+        ("nodename", ctypes.c_char * 65),
+        ("release", ctypes.c_char * 65),
+        ("version", ctypes.c_char * 65),
+        ("machine", ctypes.c_char * 65),
+    ]
+
+
+def get_uname():
+    # Создаём экземпляр структуры, в который библиотека запишет данные.
+    u = Utsname()
+
+    # Вызов функции uname().
+    # uname() напрямую обращается к системным данным ядра.
+    if libc.uname(ctypes.byref(u)) != 0:
+        raise OSError("Ошибка вызова uname()")
+
+    return u
+
+
+# Структура sysinfo() возвращает подробные сведения об оперативной памяти,
+# swap-памяти, средней загрузке системы (load average).
+# Значения памяти возвращаются в количестве единиц mem_unit (байты).
+class Sysinfo(ctypes.Structure):
+    _fields_ = [
+        ("uptime", ctypes.c_long),
+        ("loads", ctypes.c_ulong * 3),      # Средняя загрузка за 1, 5, 15 минут в формате фиксированной точки
+        ("totalram", ctypes.c_ulong),       # Общий объем RAM
+        ("freeram", ctypes.c_ulong),        # Доступная RAM
+        ("sharedram", ctypes.c_ulong),
+        ("bufferram", ctypes.c_ulong),
+        ("totalswap", ctypes.c_ulong),      # Общий объем swap
+        ("freeswap", ctypes.c_ulong),       # Доступный swap
+        ("procs", ctypes.c_ushort),
+        ("pad", ctypes.c_ushort),
+        ("totalhigh", ctypes.c_ulong),
+        ("freehigh", ctypes.c_ulong),
+        ("mem_unit", ctypes.c_uint),        # Размер единицы измерения памяти
+        ("_f", ctypes.c_char * 20)
+    ]
+
+
+def get_sysinfo():
+    # Создание структуры и вызов sysinfo().
+    # Эта функция даёт доступ к данным, доступным только ядру Linux.
+    s = Sysinfo()
+    if libc.sysinfo(ctypes.byref(s)) != 0:
+        raise OSError("Ошибка вызова sysinfo()")
+    return s
+
+
+def get_os_release():
+    # Большинство дистрибутивов Linux хранят информацию о системе
+    # в файле /etc/os-release.
+    # В нём содержатся ключи PRETTY_NAME, VERSION, ID и другие.
+    try:
+        data = {}
+        with open("/etc/os-release") as f:
+            for line in f:
+                if "=" in line:
+                    k, v = line.strip().split("=", 1)
+                    data[k] = v.strip('"')
+        return data.get("PRETTY_NAME", "Unknown Linux")
+    except Exception:
+        return "Unknown Linux"
+
+
+def get_current_user():
+    # Функция getpwuid() из модуля pwd использует системную базу пользователей /etc/passwd.
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return "unknown"
+
+
+def get_mounts():
+    # Список всех подключённых файловых систем хранится в /proc/mounts.
+    # Это виртуальный файл, создаваемый ядром.
+    # Каждая строка содержит: устройство, точку монтирования, тип файловой системы.
+    mounts = []
+    try:
+        with open("/proc/mounts") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3:
+                    device, mountpoint, fstype = parts[:3]
+                    mounts.append((device, mountpoint, fstype))
+    except Exception:
+        pass
+    return mounts
+
+
+def stat_fs(path):
+    # statvfs() возвращает статистику файловой системы:
+    try:
+        st = os.statvfs(path)
+        free = st.f_bavail * st.f_frsize   # f_bavail — количество доступных блоков
+        total = st.f_blocks * st.f_frsize  # f_blocks — всего блоков
+        return free, total
+    except Exception:
+        return None, None
+
+
+def bytes_to_mb(b):
+    return b // (1024 * 1024)
+
+
+def get_virtual_memory():
+    # Виртуальная память (поле VmallocTotal) доступна в /proc/meminfo.
+    # Эта информация не возвращается sysinfo(), поэтому здесь требуется парсинг.
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("VmallocTotal:"):
+                    # Значение указано в килобайтах, переводим в мегабайты.
+                    return int(line.split()[1]) // 1024
+    except:
+        return 0
+    return 0
+
+
+# Получение структур процента из uname() и sysinfo().
+u = get_uname()
+s = get_sysinfo()
+
+# Извлечение основных данных из структур
+os_name = get_os_release()
+kernel = u.release.decode()
+arch = u.machine.decode()
+hostname = u.nodename.decode()
+user = get_current_user()
+
+# sysinfo() возвращает значения памяти в единицах mem_unit.
+total_ram = s.totalram * s.mem_unit
+free_ram = s.freeram * s.mem_unit
+total_swap = s.totalswap * s.mem_unit
+free_swap = s.freeswap * s.mem_unit
+
+vmalloc_total = get_virtual_memory()
+
+# load average хранится в формате fixed-point 16:16.
+# Для получения реального значения делим на 65536.
+loads = [x / 65536.0 for x in s.loads]
+
+
+# Финальный вывод информации
+print(f"OS: {os_name}")
+print(f"Kernel: Linux {kernel}")
+print(f"Architecture: {arch}")
+print(f"Hostname: {hostname}")
+print(f"User: {user}")
+print(f"RAM: {bytes_to_mb(free_ram)}MB free / {bytes_to_mb(total_ram)}MB total")
+print(f"Swap: {bytes_to_mb(total_swap)}MB total / {bytes_to_mb(free_swap)}MB free")
+print(f"Virtual memory: {vmalloc_total} MB")
+print(f"Processors: {os.cpu_count()}")
+print(f"Load average: {loads[0]:.2f}, {loads[1]:.2f}, {loads[2]:.2f}")
+
+print("Drives:")
+
+# В Linux список реальных дисковых устройств хранится в /sys/block.
+# Каталоги, соответствующие дискам, называются обычно: sda, sdb, vda, nvme0n1.
+for dev in os.listdir("/sys/block"):
+    dev_path = f"/sys/block/{dev}"
+
+    # Часть имён в /sys/block — виртуальные устройства (loop*, ram*)
+    if dev.startswith(("loop", "ram")):
+        continue
+
+    size_file = os.path.join(dev_path, "size")
+
+    # Файл "size" содержит количество 512-байтных блоков.
+    try:
+        with open(size_file) as f:
+            blocks = int(f.read().strip())
+    except:
+        continue
+
+    # Переводим количество блоков в мегабайты.
+    size_mb = (blocks * 512) // (1024 * 1024)
+
+    print(f"  /dev/{dev} — {size_mb} MB")
